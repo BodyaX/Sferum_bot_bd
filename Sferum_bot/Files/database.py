@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import requests
 from fastapi import FastAPI
 
 storage = 'Files'
@@ -10,7 +11,7 @@ db = sqlite3.connect('my_bot.db')
 sql = db.cursor()
 sql.execute("""
 create table if not exists files ( 
-    id INTEGER PRIMARY KEY AUTOINCREMENT
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
     file_path TEXT,
     uid TEXT,
@@ -26,30 +27,26 @@ app = FastAPI(title="Server")
 # Функция  срабатывает, когда бот или клиент шлет пост запрос 
 @app.post("/upload/")
 def upload_file(request_data: dict):
-    user_id = request_data["uid"]
+    # Лезем внутрь словаря  по ключам и забираем то что нужно
+    user_id = str(request_data["sender"]["userId"])
+    url = request_data["attachments"]["payload"]["url"]
+    token = request_data["attachments"]["payload"]["token"]
 
-    # Вырезаем слеши из имени и расширения, защита от атаки
-    file_name = request_data["name"].replace("/", "").replace("\\", "")
-    file_ext = request_data["extension"].replace("/", "").replace("\\", "")
-    file_content = request_data["data"]
+    file_name = f"{token}.txt" #берет токен и прибавляет .txt
+    file_path = f"{storage}/{file_name}" #имя папки + имя файла
 
-    # Склеиваем безопасное имя и путь
-    full_file_name = f"{file_name}.{file_ext}"
-    file_path = f"{storage}/{full_file_name}"
+    # Отправляем GET-заропс в хранилище по адресу, в перемнную идет ответ от сервиса с содержимым файла
+    res = requests.get(f"{url}/{token}")
     
-    # Открываем файл для записи
-    # with - безопасно закроет файл в конце
-    # utf-8 - чтобы русские буквы из конспекта не стали иероглифами
-    with open(file_path, "w", encoding="utf-8") as buffer:
-        buffer.write(file_content) #закрытие диска
-        
-    # Конструкция with сама откроет базу, сама сделает commit при успехе и сама её закроет
+    # Пишем текст на диск
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(res.text)
+
+    # открыли соединение с БД
     with sqlite3.connect('my_bot.db') as local_db:
-        # Записываем данные в таблицу.
-        # Это защита от SQL-инъекций (чтобы хакер не смог удалить таблицу через имя файла)
-        local_db.execute(
-            "INSERT INTO files (name, extension, uid, file_path) VALUES (?, ?, ?, ?)", 
-            (full_file_name, file_ext, user_id, file_path)
+        local_db.execute( #выпонили SQL-запрос
+            "INSERT INTO files (name, file_path, uid) VALUES (?, ?, ?)",
+            (file_name, file_path, user_id)
         )
-        
-    return {"status": "success", "message": f"Конспект {full_file_name} успешно сохранен!"}
+
+    return {"status": "success", "file": file_path} #вернули ответ в формате JSON о том что все записалосью
