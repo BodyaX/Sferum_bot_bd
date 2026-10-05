@@ -1,52 +1,85 @@
 import sqlite3
-import os
-import requests
-from fastapi import FastAPI
+import time
+from pathlib import Path
+from fastapi import FastAPI, Request
+import httpx
+import uvicorn
 
-storage = 'Files'
-os.makedirs(storage, exist_ok=True) # Создаем папку, если ее нет
+STORAGE_DIR = Path("Files") #задается путь к папке
+STORAGE_DIR.mkdir(parents=True, exist_ok=True) #создает папку на диске
+DB_NAME = "my_bot.db" #фиксируется имя файла для бд
 
-# Подключаемся к бд и создаем таблицу для метаданных.
-db = sqlite3.connect('my_bot.db')
-sql = db.cursor()
-sql.execute("""
-create table if not exists files ( 
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    file_path TEXT,
-    uid TEXT,
-    data DATETIME DEFAULT CURRENT_TIMESTAMP
-)
-""")
-db.commit()
-db.close() 
+# Инициализация БД
+with sqlite3.connect(DB_NAME) as db:
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+    )
+    """)
 
-#запуск сервера
-app = FastAPI(title="Server")
+app = FastAPI()
 
-# Функция  срабатывает, когда бот или клиент шлет пост запрос 
-@app.post("/upload/")
-def upload_file(request_data: dict):
-    # Лезем внутрь словаря  по ключам и забираем то что нужно
-    user_id = str(request_data["sender"]["userId"])
-    url = request_data["attachments"]["payload"]["url"]
-    token = request_data["attachments"]["payload"]["token"]
+@app.post("/repo") 
+async def upload_file(req: Request):
+    try: #проверка валидности  JSON
+        data = await req.json()
+    except Exception:
+        return {"status": "error", "detail": "Invalid JSON"}
 
-    file_name = f"{token}.txt" #берет токен и прибавляет .txt
-    file_path = f"{storage}/{file_name}" #имя папки + имя файла
-
-    # Отправляем GET-заропс в хранилище по адресу, в перемнную идет ответ от сервиса с содержимым файла
-    res = requests.get(f"{url}/{token}")
+    sender = data.get("sender", {})  #достаем инфу об отправителе
+    user_id = str(sender.get("userId") or sender.get("uid", "unknown")) #скрипт вытаскивает ключ userId если его нет ищет uid
     
-    # Пишем текст на диск
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(res.text)
+    # Берем время из JSON или текущее(если серверного нету у нас)
+    try:
+        timestamp = int(data.get("timestamp", time.time()))
+    except ValueError:
+        timestamp = int(time.time())
 
-    # открыли соединение с БД
-    with sqlite3.connect('my_bot.db') as local_db:
-        local_db.execute( #выпонили SQL-запрос
-            "INSERT INTO files (name, file_path, uid) VALUES (?, ?, ?)",
-            (file_name, file_path, user_id)
-        )
+    attachments = data.get("attachments", []) #скрипт пытается достать вложение из присланного JSON
+    if not isinstance(attachments, list): #строгая проверка типа даных, (attacgments именно список)
+        return {"status": "error", "detail": "attachments must be a list"}
+    # создаем пустой список
+    saved_files = []
 
-    return {"status": "success", "file": file_path} #вернули ответ в формате JSON о том что все записалосью
+    # Открываем БД один раз на весь запрос
+    with sqlite3.connect(DB_NAME) as db_conn:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for idx, attachment in enumerate(attachments):
+                file_url = attachment.get("url")
+                raw_filename = attachment.get("filename")
+
+                if not file_url or not raw_filename:
+                    continue
+
+                # Формируем безопасное имя для сохранения на диск
+                original_filename = Path(raw_filename).name
+                safe_disk_filename = f"{timestamp}_{idx}_{original_filename}"
+                file_path = STORAGE_DIR / safe_disk_filename
+
+                # Качаем файл
+                res = await client.get(file_url)
+                if res.status_code != 200:
+                    print(f"Не удалось скачать: {original_filename}")
+                    continue  # Пропускаем файл и идем к следующему
+
+                # Сохраняем на диск
+                with open(file_path, "wb") as f:
+                    f.write(res.content)
+
+                # Пишем в базу
+                db_conn.execute(
+                    "INSERT INTO files (user_id, file_name, file_path, timestamp) VALUES (?, ?, ?, ?)",
+                    (user_id, original_filename, str(file_path), timestamp)
+                )
+                saved_files.append(str(file_path))
+        
+        db_conn.commit()
+
+    return {"status": "success", "saved": saved_files}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=60001)
